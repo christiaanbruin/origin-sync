@@ -32,6 +32,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
 
     const rawPath = req.file.path;
     const inputPath = rawPath + '.webm';
+    const wavPath = rawPath + '.wav';
 
     try {
         fs.renameSync(rawPath, inputPath);
@@ -45,103 +46,115 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt op de server' });
     }
 
-    // Forceer volledige decoding & resampling naar 44.1kHz mono PCM voor Chromaprint
-    const ffmpegCmd = `ffmpeg -y -i "${inputPath}" -ar 44100 -ac 1 -f chromaprint -fp_format raw -`;
+    // Stap 1: Converteer WebM eerst naar een fysiek WAV bestand op schijf
+    const convertCmd = `ffmpeg -y -i "${inputPath}" -ar 44100 -ac 1 "${wavPath}"`;
 
-    exec(ffmpegCmd, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+    exec(convertCmd, (convErr) => {
         if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
 
-        const combinedOutput = (stdout + "\n" + stderr).trim();
+        if (convErr || !fs.existsSync(wavPath)) {
+            console.error("FFmpeg conversie naar WAV mislukt:", convErr);
+            if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+            return res.status(500).json({ match: false, error: 'Audio conversie mislukt' });
+        }
 
-        try {
-            let liveFp = [];
+        // Stap 2: Bereken Chromaprint op de gegenereerde WAV
+        const chromaprintCmd = `ffmpeg -i "${wavPath}" -f chromaprint -fp_format raw -`;
 
-            const numberMatch = combinedOutput.match(/(-?\d+,\s*)+-?\d+/);
-            if (numberMatch) {
-                liveFp = numberMatch[0].split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
-            } else {
-                const lines = combinedOutput.split('\n');
-                for (const line of lines) {
-                    if (line.includes(',') && !line.includes('Stream') && !line.includes('encoder')) {
-                        const parsed = line.split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
-                        if (parsed.length > liveFp.length) {
-                            liveFp = parsed;
+        exec(chromaprintCmd, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+            if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+
+            const combinedOutput = (stdout + "\n" + stderr).trim();
+
+            try {
+                let liveFp = [];
+
+                const numberMatch = combinedOutput.match(/(-?\d+,\s*)+-?\d+/);
+                if (numberMatch) {
+                    liveFp = numberMatch[0].split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
+                } else {
+                    const lines = combinedOutput.split('\n');
+                    for (const line of lines) {
+                        if (line.includes(',') && !line.includes('Stream') && !line.includes('encoder')) {
+                            const parsed = line.split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
+                            if (parsed.length > liveFp.length) {
+                                liveFp = parsed;
+                            }
                         }
                     }
                 }
-            }
 
-            console.log(`FFmpeg live hashes geëxtraheerd: ${liveFp.length}`);
+                console.log(`FFmpeg live hashes geëxtraheerd: ${liveFp.length}`);
 
-            const dbRaw = fs.readFileSync(dbPath, 'utf8');
-            const dbData = JSON.parse(dbRaw);
-            const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
+                const dbRaw = fs.readFileSync(dbPath, 'utf8');
+                const dbData = JSON.parse(dbRaw);
+                const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
 
-            if (liveFp.length < 10 || !dbFp) {
-                console.error(`Te weinig hashes gegenereerd (${liveFp.length})`);
-                return res.status(500).json({ match: false, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer luider af te spelen.' });
-            }
+                if (liveFp.length < 10 || !dbFp) {
+                    console.error(`Te weinig hashes gegenereerd (${liveFp.length})`);
+                    return res.status(500).json({ match: false, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer luider af te spelen.' });
+                }
 
-            const liveLen = liveFp.length;
-            const candidates = [];
-            const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
+                const liveLen = liveFp.length;
+                const candidates = [];
+                const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
 
-            for (let i = startIndex; i <= dbFp.length - liveLen; i++) {
-                let matches = 0;
-                let tested = 0;
+                for (let i = startIndex; i <= dbFp.length - liveLen; i++) {
+                    let matches = 0;
+                    let tested = 0;
 
-                for (let j = 0; j < liveLen; j++) {
-                    const liveVal = liveFp[j] >>> 0;
-                    const dbVal = dbFp[i + j] >>> 0;
+                    for (let j = 0; j < liveLen; j++) {
+                        const liveVal = liveFp[j] >>> 0;
+                        const dbVal = dbFp[i + j] >>> 0;
 
-                    if (liveVal === 0 || dbVal === 0) continue;
+                        if (liveVal === 0 || dbVal === 0) continue;
 
-                    tested++;
-                    const xor = (liveVal ^ dbVal) >>> 0;
-                    const bitMatches = 32 - countBits(xor);
+                        tested++;
+                        const xor = (liveVal ^ dbVal) >>> 0;
+                        const bitMatches = 32 - countBits(xor);
 
-                    // 22 van de 32 bits moeten matchen
-                    if (bitMatches >= 22) {
-                        matches++;
+                        if (bitMatches >= 22) {
+                            matches++;
+                        }
+                    }
+
+                    if (tested > 0) {
+                        const score = (matches / tested) * 100;
+                        candidates.push({ index: i, score: score, matches: matches, tested: tested });
                     }
                 }
 
-                if (tested > 0) {
-                    const score = (matches / tested) * 100;
-                    candidates.push({ index: i, score: score, matches: matches, tested: tested });
-                }
+                candidates.sort((a, b) => b.matches - a.matches);
+
+                const topMatch = candidates[0] || { index: 0, score: 0, matches: 0 };
+                const bestIndex = topMatch.index;
+                const score = Math.round(topMatch.score);
+
+                const timecodeSeconds = bestIndex * 0.12383975;
+                const isMatch = topMatch.matches >= Math.floor(liveLen * 0.25);
+
+                const minutes = Math.floor(timecodeSeconds / 60);
+                const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
+
+                console.log(`Top 3 Matches in DB:`);
+                candidates.slice(0, 3).forEach((c, idx) => {
+                    const t = c.index * 0.12383975;
+                    const m = Math.floor(t / 60);
+                    const s = Math.floor(t % 60).toString().padStart(2, '0');
+                    console.log(`  #${idx + 1}: Tijd ${m}:${s} (Matches: ${c.matches}/${c.tested}, Score: ${Math.round(c.score)}%)`);
+                });
+
+                res.json({
+                    match: isMatch,
+                    score: score,
+                    timecode: timecodeSeconds,
+                    timecode_formatted: `${minutes}:${seconds}`
+                });
+            } catch (e) {
+                console.error("Crash tijdens verwerking:", e);
+                res.status(500).json({ match: false, error: e.message });
             }
-
-            candidates.sort((a, b) => b.matches - a.matches);
-
-            const topMatch = candidates[0] || { index: 0, score: 0, matches: 0 };
-            const bestIndex = topMatch.index;
-            const score = Math.round(topMatch.score);
-
-            const timecodeSeconds = bestIndex * 0.12383975;
-            const isMatch = topMatch.matches >= Math.floor(liveLen * 0.25); // Minimaal 25% van alle hashes moet bitwise matchen
-
-            const minutes = Math.floor(timecodeSeconds / 60);
-            const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
-
-            console.log(`Top 3 Matches in DB:`);
-            candidates.slice(0, 3).forEach((c, idx) => {
-                const t = c.index * 0.12383975;
-                const m = Math.floor(t / 60);
-                const s = Math.floor(t % 60).toString().padStart(2, '0');
-                console.log(`  #${idx + 1}: Tijd ${m}:${s} (Matches: ${c.matches}/${c.tested}, Score: ${Math.round(c.score)}%)`);
-            });
-
-            res.json({
-                match: isMatch,
-                score: score,
-                timecode: timecodeSeconds,
-                timecode_formatted: `${minutes}:${seconds}`
-            });
-        } catch (e) {
-            console.error("Crash tijdens verwerking:", e);
-            res.status(500).json({ match: false, error: e.message });
-        }
+        });
     });
 });
 
