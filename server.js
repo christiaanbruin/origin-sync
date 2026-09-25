@@ -19,46 +19,40 @@ const upload = multer({ dest: '/tmp/' });
 const dbPath = path.join(__dirname, 'day6_fingerprint_clean.json');
 
 app.get('/api/match', (req, res) => {
-    res.json({ status: "online", message: "Render backend werkt! Stuur een POST verzoek met audio om te matchen." });
+    res.json({ status: "online", message: "Render backend werkt!" });
 });
 
 app.post('/api/match', upload.single('audio'), (req, res) => {
     console.log("--> Audio verzoek ontvangen van mobiel!");
 
     if (!req.file) {
-        console.error("Geen audio bestand ontvangen in req.file");
         return res.status(400).json({ match: false, error: 'Geen audio bestand ontvangen' });
     }
 
-    const rawPath = req.file.path;
-    const inputPath = rawPath + '.webm';
-    const wavPath = rawPath + '.wav';
-
-    try {
-        fs.renameSync(rawPath, inputPath);
-    } catch (e) {
-        console.error("Hernoemen van temp bestand mislukt:", e);
-    }
+    const inputPath = req.file.path;
+    const wavPath = inputPath + '.wav';
 
     if (!fs.existsSync(dbPath)) {
         if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-        console.error("FOUT: day6_fingerprint_clean.json niet gevonden!");
-        return res.status(500).json({ match: false, error: 'JSON database ontbreekt op de server' });
+        return res.status(500).json({ match: false, error: 'JSON database ontbreekt' });
     }
 
-    // Stap 1: Converteer WebM/MP4 met FFmpeg naar een fysieke 11.025kHz Mono WAV op schijf
+    // FFmpeg dwingen de input via auto-detection volledig te decoderen naar 11025Hz Mono WAV
     const convertCmd = `ffmpeg -y -i "${inputPath}" -ar 11025 -ac 1 "${wavPath}"`;
 
     exec(convertCmd, (convErr) => {
         if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
 
         if (convErr || !fs.existsSync(wavPath)) {
-            console.error("FFmpeg conversie naar WAV mislukt:", convErr);
+            console.error("FFmpeg conversie fout:", convErr);
             if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
             return res.status(500).json({ match: false, error: 'Audio conversie mislukt' });
         }
 
-        // Stap 2: Bereken Chromaprint hashes over het WAV bestand
+        const wavSize = fs.statSync(wavPath).size;
+        console.log(`WAV aangemaakt. Bestandsgrootte: ${wavSize} bytes`);
+
+        // Bereken Chromaprint over het WAV bestand
         const chromaprintCmd = `ffmpeg -i "${wavPath}" -f chromaprint -fp_format raw -`;
 
         exec(chromaprintCmd, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
@@ -91,8 +85,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                 const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
 
                 if (liveFp.length < 5 || !dbFp) {
-                    console.error(`Te weinig hashes gegenereerd (${liveFp.length})`);
-                    return res.status(200).json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer luider af te spelen.' });
+                    return res.json({ match: false, score: 0, error: 'Te weinig audio opgevangen. Speel de CD luider af.' });
                 }
 
                 const liveLen = liveFp.length;
