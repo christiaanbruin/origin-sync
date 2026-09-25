@@ -45,7 +45,8 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt op de server' });
     }
 
-    const ffmpegCmd = `ffmpeg -i "${inputPath}" -f chromaprint -fp_format raw -`;
+    // Forceer volledige decoding & resampling naar 44.1kHz mono PCM voor Chromaprint
+    const ffmpegCmd = `ffmpeg -y -i "${inputPath}" -ar 44100 -ac 1 -f chromaprint -fp_format raw -`;
 
     exec(ffmpegCmd, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
         if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
@@ -76,15 +77,13 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
             const dbData = JSON.parse(dbRaw);
             const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
 
-            if (!liveFp.length || !dbFp) {
-                console.error("Geen geldige hashes gegenereerd");
-                return res.status(500).json({ match: false, error: 'Geen geldige hashes gegenereerd' });
+            if (liveFp.length < 10 || !dbFp) {
+                console.error(`Te weinig hashes gegenereerd (${liveFp.length})`);
+                return res.status(500).json({ match: false, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer luider af te spelen.' });
             }
 
             const liveLen = liveFp.length;
             const candidates = [];
-
-            // We slaan de allereerste ~10 seconden stilte/intro-ruis (ongeveer 80 hashes) over als startpunt
             const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
 
             for (let i = startIndex; i <= dbFp.length - liveLen; i++) {
@@ -95,34 +94,32 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                     const liveVal = liveFp[j] >>> 0;
                     const dbVal = dbFp[i + j] >>> 0;
 
-                    // Negeer nul- en stilte-hashes
                     if (liveVal === 0 || dbVal === 0) continue;
 
                     tested++;
                     const xor = (liveVal ^ dbVal) >>> 0;
                     const bitMatches = 32 - countBits(xor);
 
-                    // Minstens 26 van de 32 bits moeten overeenkomen
-                    if (bitMatches >= 26) {
+                    // 22 van de 32 bits moeten matchen
+                    if (bitMatches >= 22) {
                         matches++;
                     }
                 }
 
                 if (tested > 0) {
                     const score = (matches / tested) * 100;
-                    candidates.push({ index: i, score: score, matches: matches });
+                    candidates.push({ index: i, score: score, matches: matches, tested: tested });
                 }
             }
 
-            // Sorteer kandidaten op hoogste score
-            candidates.sort((a, b) => b.score - a.score);
+            candidates.sort((a, b) => b.matches - a.matches);
 
-            const topMatch = candidates[0] || { index: 0, score: 0 };
+            const topMatch = candidates[0] || { index: 0, score: 0, matches: 0 };
             const bestIndex = topMatch.index;
             const score = Math.round(topMatch.score);
 
             const timecodeSeconds = bestIndex * 0.12383975;
-            const isMatch = score >= 20; // 20% van actieve unieke muziek-hashes
+            const isMatch = topMatch.matches >= Math.floor(liveLen * 0.25); // Minimaal 25% van alle hashes moet bitwise matchen
 
             const minutes = Math.floor(timecodeSeconds / 60);
             const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
@@ -132,7 +129,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                 const t = c.index * 0.12383975;
                 const m = Math.floor(t / 60);
                 const s = Math.floor(t % 60).toString().padStart(2, '0');
-                console.log(`  #${idx + 1}: Tijd ${m}:${s} (Score: ${Math.round(c.score)}%, Matches: ${c.matches})`);
+                console.log(`  #${idx + 1}: Tijd ${m}:${s} (Matches: ${c.matches}/${c.tested}, Score: ${Math.round(c.score)}%)`);
             });
 
             res.json({
