@@ -7,7 +7,6 @@ const cors = require('cors');
 
 const app = express();
 
-// 1. Volledige CORS vrijgave voor mobiele browsers (Safari/Brave/Chrome)
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -19,90 +18,102 @@ app.options('*', cors());
 const upload = multer({ dest: '/tmp/' });
 const dbPath = path.join(__dirname, 'day6_fingerprint_clean.json');
 
-// Test-route voor GET verzoeken via de browser
 app.get('/api/match', (req, res) => {
     res.json({ status: "online", message: "Render backend werkt! Stuur een POST verzoek met audio om te matchen." });
 });
 
-// De daadwerkelijke audio matching route (POST)
 app.post('/api/match', upload.single('audio'), (req, res) => {
     console.log("--> Audio verzoek ontvangen van mobiel!");
 
     if (!req.file) {
-        console.error("Geen audio bestand in req.file");
-        return res.status(400).json({ match: false, error: 'Geen audio ontvangen' });
+        console.error("Geen audio bestand ontvangen in req.file");
+        return res.status(400).json({ match: false, error: 'Geen audio bestand ontvangen' });
     }
 
-    // Voeg .webm extensie toe voor ffmpeg/fpcalc
-    const oldPath = req.file.path;
-    const tempFilePath = oldPath + '.webm';
-    fs.renameSync(oldPath, tempFilePath);
+    const rawPath = req.file.path;
+    const wavPath = rawPath + '.wav';
 
     if (!fs.existsSync(dbPath)) {
-        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+        if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath);
         console.error("FOUT: day6_fingerprint_clean.json niet gevonden!");
-        return res.status(500).json({ match: false, error: 'JSON database ontbreekt' });
+        return res.status(500).json({ match: false, error: 'JSON database ontbreekt op de server' });
     }
 
-    console.log("fpcalc uitvoeren op:", tempFilePath);
-    exec(`fpcalc -json "${tempFilePath}"`, (error, stdout, stderr) => {
-        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+    // 1. Converteer mobiele opname met FFmpeg naar schone 11.025kHz Mono WAV voor fpcalc
+    const ffmpegCmd = `ffmpeg -y -i "${rawPath}" -ar 11025 -ac 1 "${wavPath}"`;
 
-        if (error || !stdout) {
-            console.error("fpcalc fout:", stderr || error);
-            return res.status(500).json({ match: false, error: 'fpcalc kon audio niet verwerken' });
+    exec(ffmpegCmd, (ffmpegErr, ffmpegStdout, ffmpegStderr) => {
+        // Ruwe tijdelijke bestand opruimen
+        if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath);
+
+        if (ffmpegErr) {
+            console.error("FFmpeg conversiefout:", ffmpegStderr || ffmpegErr);
+            if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+            return res.status(500).json({ match: false, error: 'Kon audio niet converteren via ffmpeg' });
         }
 
-        try {
-            const liveData = JSON.parse(stdout);
-            const liveFp = liveData.fingerprint;
+        // 2. Voer fpcalc uit op de geconverteerde WAV
+        console.log("fpcalc uitvoeren op:", wavPath);
+        exec(`fpcalc -json "${wavPath}"`, (fpErr, stdout, stderr) => {
+            if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
 
-            const dbRaw = fs.readFileSync(dbPath, 'utf8');
-            const dbData = JSON.parse(dbRaw);
-            const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
-
-            if (!liveFp || !dbFp) {
-                return res.status(500).json({ match: false, error: 'Ongeldige fingerprint structuur' });
+            if (fpErr || !stdout) {
+                console.error("fpcalc execution error:", fpErr || stderr);
+                return res.status(500).json({ match: false, error: 'fpcalc kon audio niet verwerken' });
             }
 
-            console.log(`Vergelijken: ${liveFp.length} live hashes met ${dbFp.length} DB hashes`);
+            try {
+                const liveData = JSON.parse(stdout);
+                const liveFp = liveData.fingerprint;
 
-            let bestIndex = -1;
-            let maxMatches = 0;
-            const liveLen = liveFp.length;
+                const dbRaw = fs.readFileSync(dbPath, 'utf8');
+                const dbData = JSON.parse(dbRaw);
+                const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
 
-            for (let i = 0; i <= dbFp.length - liveLen; i++) {
-                let matches = 0;
-                for (let j = 0; j < liveLen; j++) {
-                    const xor = (liveFp[j] ^ dbFp[i + j]) >>> 0;
-                    const bitMatches = 32 - countBits(xor);
-                    if (bitMatches >= 20) matches++;
+                if (!liveFp || !dbFp) {
+                    console.error("Ongeldige fingerprint structuur");
+                    return res.status(500).json({ match: false, error: 'Ongeldige fingerprint structuur in JSON' });
                 }
-                if (matches > maxMatches) {
-                    maxMatches = matches;
-                    bestIndex = i;
+
+                console.log(`Vergelijken: ${liveFp.length} live hashes met ${dbFp.length} DB hashes`);
+
+                let bestIndex = -1;
+                let maxMatches = 0;
+                const liveLen = liveFp.length;
+
+                for (let i = 0; i <= dbFp.length - liveLen; i++) {
+                    let matches = 0;
+                    for (let j = 0; j < liveLen; j++) {
+                        const xor = (liveFp[j] ^ dbFp[i + j]) >>> 0;
+                        const bitMatches = 32 - countBits(xor);
+                        if (bitMatches >= 20) matches++;
+                    }
+                    if (matches > maxMatches) {
+                        maxMatches = matches;
+                        bestIndex = i;
+                    }
                 }
+
+                const score = (maxMatches / liveLen) * 100;
+                const timecodeSeconds = bestIndex * 0.12383975;
+                const isMatch = score >= 35;
+
+                const minutes = Math.floor(timecodeSeconds / 60);
+                const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
+
+                console.log(`Uitslag: Match=${isMatch}, Score=${Math.round(score)}%, Tijd=${minutes}:${seconds}`);
+
+                res.json({
+                    match: isMatch,
+                    score: Math.round(score),
+                    timecode: timecodeSeconds,
+                    timecode_formatted: `${minutes}:${seconds}`
+                });
+            } catch (e) {
+                console.error("Crash tijdens verwerking:", e);
+                res.status(500).json({ match: false, error: e.message });
             }
-
-            const score = (maxMatches / liveLen) * 100;
-            const timecodeSeconds = bestIndex * 0.12383975;
-            const isMatch = score >= 35;
-
-            const minutes = Math.floor(timecodeSeconds / 60);
-            const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
-
-            console.log(`Uitslag: Match=${isMatch}, Score=${Math.round(score)}%, Tijd=${minutes}:${seconds}`);
-
-            res.json({
-                match: isMatch,
-                score: Math.round(score),
-                timecode: timecodeSeconds,
-                timecode_formatted: `${minutes}:${seconds}`
-            });
-        } catch (e) {
-            console.error("Crash tijdens verwerking:", e);
-            res.status(500).json({ match: false, error: e.message });
-        }
+        });
     });
 });
 
