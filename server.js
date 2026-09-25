@@ -70,7 +70,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                 }
             }
 
-            console.log(`FFmpeg ontleed. Live hashes: ${liveFp.length}`);
+            console.log(`FFmpeg live hashes geëxtraheerd: ${liveFp.length}`);
 
             const dbRaw = fs.readFileSync(dbPath, 'utf8');
             const dbData = JSON.parse(dbRaw);
@@ -81,55 +81,63 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                 return res.status(500).json({ match: false, error: 'Geen geldige hashes gegenereerd' });
             }
 
-            // Filter nutteloze stilte / nul-hashes
-            const validLiveFp = liveFp.filter(h => h !== 0 && h !== -1);
-            if (validLiveFp.length === 0) {
-                return res.json({ match: false, error: 'Te veel stilte/ruis in opname' });
-            }
-
-            let bestIndex = -1;
-            let maxMatches = 0;
             const liveLen = liveFp.length;
+            const candidates = [];
 
-            // Hamming distance matching met verhoogde drempel (24/32 bits = 75% bitwise match)
-            for (let i = 0; i <= dbFp.length - liveLen; i++) {
+            // We slaan de allereerste ~10 seconden stilte/intro-ruis (ongeveer 80 hashes) over als startpunt
+            const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
+
+            for (let i = startIndex; i <= dbFp.length - liveLen; i++) {
                 let matches = 0;
-                for (let j = 0; j < liveLen; j++) {
-                    const liveVal = liveFp[j];
-                    const dbVal = dbFp[i + j];
+                let tested = 0;
 
-                    // Sla stilte-hashes in de DB of Live stream over
+                for (let j = 0; j < liveLen; j++) {
+                    const liveVal = liveFp[j] >>> 0;
+                    const dbVal = dbFp[i + j] >>> 0;
+
+                    // Negeer nul- en stilte-hashes
                     if (liveVal === 0 || dbVal === 0) continue;
 
+                    tested++;
                     const xor = (liveVal ^ dbVal) >>> 0;
                     const bitMatches = 32 - countBits(xor);
 
-                    // Minimaal 24 van de 32 bits moeten identiek zijn
-                    if (bitMatches >= 24) {
+                    // Minstens 26 van de 32 bits moeten overeenkomen
+                    if (bitMatches >= 26) {
                         matches++;
                     }
                 }
 
-                if (matches > maxMatches) {
-                    maxMatches = matches;
-                    bestIndex = i;
+                if (tested > 0) {
+                    const score = (matches / tested) * 100;
+                    candidates.push({ index: i, score: score, matches: matches });
                 }
             }
 
-            const score = (maxMatches / liveLen) * 100;
-            const timecodeSeconds = bestIndex >= 0 ? bestIndex * 0.12383975 : 0;
-            
-            // Drempelwaarde voor een echte match verhoogd naar 25% van alle geteste hashes
-            const isMatch = score >= 25 && bestIndex >= 0;
+            // Sorteer kandidaten op hoogste score
+            candidates.sort((a, b) => b.score - a.score);
+
+            const topMatch = candidates[0] || { index: 0, score: 0 };
+            const bestIndex = topMatch.index;
+            const score = Math.round(topMatch.score);
+
+            const timecodeSeconds = bestIndex * 0.12383975;
+            const isMatch = score >= 20; // 20% van actieve unieke muziek-hashes
 
             const minutes = Math.floor(timecodeSeconds / 60);
             const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
 
-            console.log(`Resultaat -> MaxMatches: ${maxMatches}/${liveLen}, Score: ${Math.round(score)}%, Index: ${bestIndex} (${minutes}:${seconds})`);
+            console.log(`Top 3 Matches in DB:`);
+            candidates.slice(0, 3).forEach((c, idx) => {
+                const t = c.index * 0.12383975;
+                const m = Math.floor(t / 60);
+                const s = Math.floor(t % 60).toString().padStart(2, '0');
+                console.log(`  #${idx + 1}: Tijd ${m}:${s} (Score: ${Math.round(c.score)}%, Matches: ${c.matches})`);
+            });
 
             res.json({
                 match: isMatch,
-                score: Math.round(score),
+                score: score,
                 timecode: timecodeSeconds,
                 timecode_formatted: `${minutes}:${seconds}`
             });
