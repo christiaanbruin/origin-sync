@@ -30,30 +30,39 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(400).json({ match: false, error: 'Geen audio bestand ontvangen' });
     }
 
+    // Geef het ruwe bestand expliciet de extensie .webm zodat FFmpeg de container snapt
     const rawPath = req.file.path;
+    const inputPath = rawPath + '.webm';
     const wavPath = rawPath + '.wav';
 
+    try {
+        fs.renameSync(rawPath, inputPath);
+    } catch (e) {
+        console.error("Hernoemen van temp bestand mislukt:", e);
+    }
+
     if (!fs.existsSync(dbPath)) {
-        if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath);
+        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
         console.error("FOUT: day6_fingerprint_clean.json niet gevonden!");
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt op de server' });
     }
 
-    // 1. Converteer mobiele opname met FFmpeg naar schone 11.025kHz Mono WAV voor fpcalc
-    const ffmpegCmd = `ffmpeg -y -i "${rawPath}" -ar 11025 -ac 1 "${wavPath}"`;
+    // FFmpeg krijgt nu expliciet instructies om het webm/ogg/mp4 formaat om te zetten naar schone 11.025kHz Mono WAV
+    const ffmpegCmd = `ffmpeg -y -i "${inputPath}" -ar 11025 -ac 1 -c:a pcm_s16le "${wavPath}"`;
 
     exec(ffmpegCmd, (ffmpegErr, ffmpegStdout, ffmpegStderr) => {
-        // Ruwe tijdelijke bestand opruimen
-        if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath);
+        // Ruwe webm opruimen
+        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
 
-        if (ffmpegErr) {
+        if (ffmpegErr || !fs.existsSync(wavPath) || fs.statSync(wavPath).size === 0) {
             console.error("FFmpeg conversiefout:", ffmpegStderr || ffmpegErr);
             if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
             return res.status(500).json({ match: false, error: 'Kon audio niet converteren via ffmpeg' });
         }
 
-        // 2. Voer fpcalc uit op de geconverteerde WAV
-        console.log("fpcalc uitvoeren op:", wavPath);
+        console.log(`WAV bestand succesvol aangemaakt (${fs.statSync(wavPath).size} bytes). fpcalc uitvoeren...`);
+
+        // Voer fpcalc uit op de schone WAV
         exec(`fpcalc -json "${wavPath}"`, (fpErr, stdout, stderr) => {
             if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
 
