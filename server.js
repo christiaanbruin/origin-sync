@@ -30,7 +30,6 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(400).json({ match: false, error: 'Geen audio bestand ontvangen' });
     }
 
-    // Geef het ruwe bestand expliciet de extensie .webm zodat FFmpeg de container snapt
     const rawPath = req.file.path;
     const inputPath = rawPath + '.webm';
     const wavPath = rawPath + '.wav';
@@ -47,11 +46,11 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt op de server' });
     }
 
-    // FFmpeg krijgt nu expliciet instructies om het webm/ogg/mp4 formaat om te zetten naar schone 11.025kHz Mono WAV
-    const ffmpegCmd = `ffmpeg -y -i "${inputPath}" -ar 11025 -ac 1 -c:a pcm_s16le "${wavPath}"`;
+    // FFmpeg: Converteer naar standaard 44.1kHz 16-bit Mono PCM WAV (100% compatibel met fpcalc)
+    const ffmpegCmd = `ffmpeg -y -i "${inputPath}" -vn -ar 44100 -ac 1 -c:a pcm_s16le "${wavPath}"`;
 
     exec(ffmpegCmd, (ffmpegErr, ffmpegStdout, ffmpegStderr) => {
-        // Ruwe webm opruimen
+        // Ruwe input opruimen
         if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
 
         if (ffmpegErr || !fs.existsSync(wavPath) || fs.statSync(wavPath).size === 0) {
@@ -62,7 +61,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
 
         console.log(`WAV bestand succesvol aangemaakt (${fs.statSync(wavPath).size} bytes). fpcalc uitvoeren...`);
 
-        // Voer fpcalc uit op de schone WAV
+        // Voer fpcalc uit op de 44.1kHz WAV
         exec(`fpcalc -json "${wavPath}"`, (fpErr, stdout, stderr) => {
             if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
 
