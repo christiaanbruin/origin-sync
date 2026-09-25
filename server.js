@@ -45,31 +45,31 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt op de server' });
     }
 
-    // FFmpeg converteert direct naar ruwe PCM 16-bit Mono (11025Hz) en stuurt via pipe naar fpcalc -raw
-    const rawCmd = `ffmpeg -y -i "${inputPath}" -f s16le -ar 11025 -ac 1 - | fpcalc -raw -rate 11025 -channels 1 -length 10 -json -`;
+    // Gebruik het ingebouwde Chromaprint filter van FFmpeg (vuurt fpcalc-compatibele raw hashes af)
+    const ffmpegCmd = `ffmpeg -i "${inputPath}" -f chromaprint -fp_format raw -`;
 
-    console.log("FFmpeg + fpcalc raw pipeline uitvoeren...");
+    console.log("FFmpeg Chromaprint berekenen...");
 
-    exec(rawCmd, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
-        // Temp bestand altijd direct opruimen
+    exec(ffmpegCmd, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+        // Temp bestand direct opruimen
         if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
 
         if (err || !stdout) {
-            console.error("Pipeline fout:", stderr || err);
-            return res.status(500).json({ match: false, error: 'fpcalc kon ruwe stream niet verwerken' });
+            console.error("FFmpeg Chromaprint fout:", stderr || err);
+            return res.status(500).json({ match: false, error: 'FFmpeg kon fingerprint niet berekenen' });
         }
 
         try {
-            const liveData = JSON.parse(stdout);
-            const liveFp = liveData.fingerprint;
+            // FFmpeg geeft komma-gescheiden 32-bit integers terug
+            const liveFp = stdout.trim().split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
 
             const dbRaw = fs.readFileSync(dbPath, 'utf8');
             const dbData = JSON.parse(dbRaw);
             const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
 
-            if (!liveFp || !dbFp) {
+            if (!liveFp.length || !dbFp) {
                 console.error("Ongeldige fingerprint structuur");
-                return res.status(500).json({ match: false, error: 'Ongeldige fingerprint structuur in JSON' });
+                return res.status(500).json({ match: false, error: 'Geen geldige hashes gegenereerd' });
             }
 
             console.log(`Vergelijken: ${liveFp.length} live hashes met ${dbFp.length} DB hashes`);
