@@ -46,8 +46,8 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt op de server' });
     }
 
-    // Stap 1: Converteer WebM eerst naar een fysiek WAV bestand op schijf
-    const convertCmd = `ffmpeg -y -i "${inputPath}" -ar 44100 -ac 1 "${wavPath}"`;
+    // Stap 1: Converteer WebM/MP4 met FFmpeg naar een fysieke 11.025kHz Mono WAV op schijf
+    const convertCmd = `ffmpeg -y -i "${inputPath}" -ar 11025 -ac 1 "${wavPath}"`;
 
     exec(convertCmd, (convErr) => {
         if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
@@ -58,7 +58,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
             return res.status(500).json({ match: false, error: 'Audio conversie mislukt' });
         }
 
-        // Stap 2: Bereken Chromaprint op de gegenereerde WAV
+        // Stap 2: Bereken Chromaprint hashes over het WAV bestand
         const chromaprintCmd = `ffmpeg -i "${wavPath}" -f chromaprint -fp_format raw -`;
 
         exec(chromaprintCmd, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
@@ -90,9 +90,9 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                 const dbData = JSON.parse(dbRaw);
                 const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
 
-                if (liveFp.length < 10 || !dbFp) {
+                if (liveFp.length < 5 || !dbFp) {
                     console.error(`Te weinig hashes gegenereerd (${liveFp.length})`);
-                    return res.status(500).json({ match: false, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer luider af te spelen.' });
+                    return res.status(200).json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer luider af te spelen.' });
                 }
 
                 const liveLen = liveFp.length;
@@ -113,7 +113,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                         const xor = (liveVal ^ dbVal) >>> 0;
                         const bitMatches = 32 - countBits(xor);
 
-                        if (bitMatches >= 22) {
+                        if (bitMatches >= 20) {
                             matches++;
                         }
                     }
@@ -131,7 +131,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                 const score = Math.round(topMatch.score);
 
                 const timecodeSeconds = bestIndex * 0.12383975;
-                const isMatch = topMatch.matches >= Math.floor(liveLen * 0.25);
+                const isMatch = topMatch.matches >= Math.floor(liveLen * 0.20);
 
                 const minutes = Math.floor(timecodeSeconds / 60);
                 const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
