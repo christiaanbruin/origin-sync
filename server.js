@@ -7,34 +7,49 @@ const cors = require('cors');
 
 const app = express();
 
-// Expliciete CORS ondersteuning inschakelen voor alle domeinen en HTTP methoden
+// 1. Volledige CORS vrijgave voor mobiele browsers (Safari/Brave/Chrome)
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['*']
 }));
 
-// Zorg dat OPTIONS preflight-requests direct een OK status krijgen
 app.options('*', cors());
 
 const upload = multer({ dest: '/tmp/' });
-
-// Laad de Day 6 JSON database
 const dbPath = path.join(__dirname, 'day6_fingerprint_clean.json');
 
+// Test-route voor GET verzoeken via de browser
+app.get('/api/match', (req, res) => {
+    res.json({ status: "online", message: "Render backend werkt! Stuur een POST verzoek met audio om te matchen." });
+});
+
+// De daadwerkelijke audio matching route (POST)
 app.post('/api/match', upload.single('audio'), (req, res) => {
+    console.log("--> Audio verzoek ontvangen van mobiel!");
+
     if (!req.file) {
+        console.error("Geen audio bestand in req.file");
         return res.status(400).json({ match: false, error: 'Geen audio ontvangen' });
     }
 
-    const tempFilePath = req.file.path;
+    // Voeg .webm extensie toe voor ffmpeg/fpcalc
+    const oldPath = req.file.path;
+    const tempFilePath = oldPath + '.webm';
+    fs.renameSync(oldPath, tempFilePath);
 
-    // Voer fpcalc uit op de geüploade microfoonopname
-    exec(`fpcalc -json "${tempFilePath}"`, (error, stdout) => {
-        // Verwijder het tijdelijke bestand
+    if (!fs.existsSync(dbPath)) {
+        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+        console.error("FOUT: day6_fingerprint_clean.json niet gevonden!");
+        return res.status(500).json({ match: false, error: 'JSON database ontbreekt' });
+    }
+
+    console.log("fpcalc uitvoeren op:", tempFilePath);
+    exec(`fpcalc -json "${tempFilePath}"`, (error, stdout, stderr) => {
         if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
 
         if (error || !stdout) {
+            console.error("fpcalc fout:", stderr || error);
             return res.status(500).json({ match: false, error: 'fpcalc kon audio niet verwerken' });
         }
 
@@ -42,12 +57,15 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
             const liveData = JSON.parse(stdout);
             const liveFp = liveData.fingerprint;
 
-            if (!fs.existsSync(dbPath)) {
-                return res.status(500).json({ match: false, error: 'JSON database niet gevonden' });
+            const dbRaw = fs.readFileSync(dbPath, 'utf8');
+            const dbData = JSON.parse(dbRaw);
+            const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
+
+            if (!liveFp || !dbFp) {
+                return res.status(500).json({ match: false, error: 'Ongeldige fingerprint structuur' });
             }
 
-            const dbData = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
-            const dbFp = dbData.fingerprint;
+            console.log(`Vergelijken: ${liveFp.length} live hashes met ${dbFp.length} DB hashes`);
 
             let bestIndex = -1;
             let maxMatches = 0;
@@ -73,6 +91,8 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
             const minutes = Math.floor(timecodeSeconds / 60);
             const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
 
+            console.log(`Uitslag: Match=${isMatch}, Score=${Math.round(score)}%, Tijd=${minutes}:${seconds}`);
+
             res.json({
                 match: isMatch,
                 score: Math.round(score),
@@ -80,6 +100,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                 timecode_formatted: `${minutes}:${seconds}`
             });
         } catch (e) {
+            console.error("Crash tijdens verwerking:", e);
             res.status(500).json({ match: false, error: e.message });
         }
     });
