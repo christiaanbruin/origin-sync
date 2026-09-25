@@ -45,7 +45,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt op de server' });
     }
 
-    // Gebruik het ingebouwde Chromaprint filter van FFmpeg (vuurt fpcalc-compatibele raw hashes af)
+    // Gebruik FFmpeg met raw chromaprint output
     const ffmpegCmd = `ffmpeg -i "${inputPath}" -f chromaprint -fp_format raw -`;
 
     console.log("FFmpeg Chromaprint berekenen...");
@@ -54,21 +54,38 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         // Temp bestand direct opruimen
         if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
 
-        if (err || !stdout) {
-            console.error("FFmpeg Chromaprint fout:", stderr || err);
-            return res.status(500).json({ match: false, error: 'FFmpeg kon fingerprint niet berekenen' });
-        }
+        // Combineer stdout en stderr omdat FFmpeg output soms naar stderr gooit
+        const combinedOutput = (stdout + "\n" + stderr).trim();
 
         try {
-            // FFmpeg geeft komma-gescheiden 32-bit integers terug
-            const liveFp = stdout.trim().split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
+            // Zoek naar getallenreeksen (komma-gescheiden 32-bit integers)
+            let liveFp = [];
+
+            // 1. Probeer te matchen op een komma-gescheiden lijst getallen
+            const numberMatch = combinedOutput.match(/(-?\d+,\s*)+-?\d+/);
+            if (numberMatch) {
+                liveFp = numberMatch[0].split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
+            } else {
+                // 2. Fallback: filter alle losse integers uit de output
+                const lines = combinedOutput.split('\n');
+                for (const line of lines) {
+                    if (line.includes(',') && !line.includes('Stream') && !line.includes('encoder')) {
+                        const parsed = line.split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
+                        if (parsed.length > liveFp.length) {
+                            liveFp = parsed;
+                        }
+                    }
+                }
+            }
+
+            console.log(`FFmpeg verwerkt. Gegenereerde hashes: ${liveFp.length}`);
 
             const dbRaw = fs.readFileSync(dbPath, 'utf8');
             const dbData = JSON.parse(dbRaw);
             const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
 
             if (!liveFp.length || !dbFp) {
-                console.error("Ongeldige fingerprint structuur");
+                console.error("Geen geldige hashes kunnen ontleden uit output:", combinedOutput.substring(0, 300));
                 return res.status(500).json({ match: false, error: 'Geen geldige hashes gegenereerd' });
             }
 
@@ -107,7 +124,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                 timecode_formatted: `${minutes}:${seconds}`
             });
         } catch (e) {
-            console.error("Crash tijdens verwerking van JSON:", e);
+            console.error("Crash tijdens verwerking:", e);
             res.status(500).json({ match: false, error: e.message });
         }
     });
