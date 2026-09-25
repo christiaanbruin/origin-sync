@@ -6,7 +6,16 @@ const path = require('path');
 const cors = require('cors');
 
 const app = express();
-app.use(cors());
+
+// Expliciete CORS ondersteuning inschakelen voor alle domeinen en HTTP methoden
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Zorg dat OPTIONS preflight-requests direct een OK status krijgen
+app.options('*', cors());
 
 const upload = multer({ dest: '/tmp/' });
 
