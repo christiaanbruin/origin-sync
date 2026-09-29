@@ -31,6 +31,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
 
     const rawPath = req.file.path;
     const inputWav = rawPath + '_input.wav';
+    const cleanWav = rawPath + '_clean.wav';
 
     try {
         fs.renameSync(rawPath, inputWav);
@@ -43,92 +44,105 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt' });
     }
 
-    // FFmpeg converteert de WAV naar 11025Hz 16-bit Mono PCM (-f s16le) en stuurt het via pipe (-) direct naar fpcalc -raw
-    const pipelineCmd = `ffmpeg -y -i "${inputWav}" -f s16le -ar 11025 -ac 1 -c:a pcm_s16le - | fpcalc -raw -rate 11025 -channels 1 -json -`;
+    // FFmpeg converteert naar een 100% standaarde 44.1kHz 16-bit Mono WAV
+    const convertCmd = `ffmpeg -y -i "${inputWav}" -ar 44100 -ac 1 -c:a pcm_s16le "${cleanWav}"`;
 
-    console.log("FFmpeg -> fpcalc pipe uitvoeren...");
-
-    exec(pipelineCmd, { maxBuffer: 1024 * 1024 * 10 }, (fpErr, stdout, stderr) => {
+    exec(convertCmd, (convErr) => {
         if (fs.existsSync(inputWav)) fs.unlinkSync(inputWav);
 
-        if (fpErr || !stdout) {
-            console.error("fpcalc pipe fout:", stderr || fpErr);
-            return res.status(500).json({ match: false, error: 'fpcalc kon ruwe stream niet verwerken' });
+        if (convErr || !fs.existsSync(cleanWav)) {
+            console.error("FFmpeg conversie fout:", convErr);
+            if (fs.existsSync(cleanWav)) fs.unlinkSync(cleanWav);
+            return res.status(500).json({ match: false, error: 'Audio conversie mislukt op server' });
         }
 
-        try {
-            const liveData = JSON.parse(stdout);
-            const liveFp = liveData.fingerprint || [];
+        console.log(`44.1kHz WAV aangemaakt (${fs.statSync(cleanWav).size} bytes). fpcalc uitvoeren...`);
 
-            console.log(`fpcalc live hashes geëxtraheerd: ${liveFp.length}`);
+        // Voer fpcalc uit op het 44.1kHz WAV bestand (zonder -raw vlag)
+        const fpcalcCmd = `fpcalc -json "${cleanWav}"`;
 
-            const dbRaw = fs.readFileSync(dbPath, 'utf8');
-            const dbData = JSON.parse(dbRaw);
-            const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
+        exec(fpcalcCmd, { maxBuffer: 1024 * 1024 * 10 }, (fpErr, stdout, stderr) => {
+            if (fs.existsSync(cleanWav)) fs.unlinkSync(cleanWav);
 
-            if (liveFp.length < 5 || !dbFp) {
-                return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer opnieuw.' });
+            if (fpErr || !stdout) {
+                console.error("fpcalc execution error:", fpErr || stderr);
+                return res.status(500).json({ match: false, error: 'fpcalc kon audio niet verwerken' });
             }
 
-            const liveLen = liveFp.length;
-            const candidates = [];
-            const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
+            try {
+                const liveData = JSON.parse(stdout);
+                const liveFp = liveData.fingerprint || [];
 
-            for (let i = startIndex; i <= dbFp.length - liveLen; i++) {
-                let matches = 0;
-                let tested = 0;
+                console.log(`fpcalc live hashes geëxtraheerd: ${liveFp.length}`);
 
-                for (let j = 0; j < liveLen; j++) {
-                    const liveVal = liveFp[j] >>> 0;
-                    const dbVal = dbFp[i + j] >>> 0;
+                const dbRaw = fs.readFileSync(dbPath, 'utf8');
+                const dbData = JSON.parse(dbRaw);
+                const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
 
-                    if (liveVal === 0 || dbVal === 0) continue;
+                if (liveFp.length < 5 || !dbFp) {
+                    return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer opnieuw.' });
+                }
 
-                    tested++;
-                    const xor = (liveVal ^ dbVal) >>> 0;
-                    const bitMatches = 32 - countBits(xor);
+                const liveLen = liveFp.length;
+                const candidates = [];
+                const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
 
-                    if (bitMatches >= 18) {
-                        matches++;
+                for (let i = startIndex; i <= dbFp.length - liveLen; i++) {
+                    let matches = 0;
+                    let tested = 0;
+
+                    for (let j = 0; j < liveLen; j++) {
+                        const liveVal = liveFp[j] >>> 0;
+                        const dbVal = dbFp[i + j] >>> 0;
+
+                        if (liveVal === 0 || dbVal === 0) continue;
+
+                        tested++;
+                        const xor = (liveVal ^ dbVal) >>> 0;
+                        const bitMatches = 32 - countBits(xor);
+
+                        if (bitMatches >= 18) {
+                            matches++;
+                        }
+                    }
+
+                    if (tested > 0) {
+                        const score = (matches / tested) * 100;
+                        candidates.push({ index: i, score: score, matches: matches, tested: tested });
                     }
                 }
 
-                if (tested > 0) {
-                    const score = (matches / tested) * 100;
-                    candidates.push({ index: i, score: score, matches: matches, tested: tested });
-                }
+                candidates.sort((a, b) => b.matches - a.matches);
+
+                const topMatch = candidates[0] || { index: 0, score: 0, matches: 0 };
+                const bestIndex = topMatch.index;
+                const score = Math.round(topMatch.score);
+
+                const timecodeSeconds = bestIndex * 0.12383975;
+                const isMatch = topMatch.matches >= Math.floor(liveLen * 0.15);
+
+                const minutes = Math.floor(timecodeSeconds / 60);
+                const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
+
+                console.log(`Top 3 Matches in DB:`);
+                candidates.slice(0, 3).forEach((c, idx) => {
+                    const t = c.index * 0.12383975;
+                    const m = Math.floor(t / 60);
+                    const s = Math.floor(t % 60).toString().padStart(2, '0');
+                    console.log(`  #${idx + 1}: Tijd ${m}:${s} (Matches: ${c.matches}/${c.tested}, Score: ${Math.round(c.score)}%)`);
+                });
+
+                res.json({
+                    match: isMatch,
+                    score: score,
+                    timecode: timecodeSeconds,
+                    timecode_formatted: `${minutes}:${seconds}`
+                });
+            } catch (e) {
+                console.error("Crash tijdens verwerking van JSON:", e);
+                res.status(500).json({ match: false, error: e.message });
             }
-
-            candidates.sort((a, b) => b.matches - a.matches);
-
-            const topMatch = candidates[0] || { index: 0, score: 0, matches: 0 };
-            const bestIndex = topMatch.index;
-            const score = Math.round(topMatch.score);
-
-            const timecodeSeconds = bestIndex * 0.12383975;
-            const isMatch = topMatch.matches >= Math.floor(liveLen * 0.15);
-
-            const minutes = Math.floor(timecodeSeconds / 60);
-            const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
-
-            console.log(`Top 3 Matches in DB:`);
-            candidates.slice(0, 3).forEach((c, idx) => {
-                const t = c.index * 0.12383975;
-                const m = Math.floor(t / 60);
-                const s = Math.floor(t % 60).toString().padStart(2, '0');
-                console.log(`  #${idx + 1}: Tijd ${m}:${s} (Matches: ${c.matches}/${c.tested}, Score: ${Math.round(c.score)}%)`);
-            });
-
-            res.json({
-                match: isMatch,
-                score: score,
-                timecode: timecodeSeconds,
-                timecode_formatted: `${minutes}:${seconds}`
-            });
-        } catch (e) {
-            console.error("Crash tijdens verwerking van JSON:", e);
-            res.status(500).json({ match: false, error: e.message });
-        }
+        });
     });
 });
 
