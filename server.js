@@ -44,53 +44,44 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt' });
     }
 
-    // FFmpeg converteert de schone WAV naar 11025Hz Mono zonder vervorming
-    const convertCmd = `ffmpeg -y -i "${inputWav}" -ar 11025 -ac 1 "${cleanWav}"`;
+    // 1. Converteer de binnenkomende WAV naar gestandaardiseerde 11025Hz 16-bit Mono PCM WAV
+    const convertCmd = `ffmpeg -y -i "${inputWav}" -ar 11025 -ac 1 -c:a pcm_s16le "${cleanWav}"`;
 
     exec(convertCmd, (convErr) => {
         if (fs.existsSync(inputWav)) fs.unlinkSync(inputWav);
 
         if (convErr || !fs.existsSync(cleanWav)) {
-            console.error("FFmpeg conversie fout:", convErr);
+            console.error("FFmpeg conversiefout:", convErr);
             if (fs.existsSync(cleanWav)) fs.unlinkSync(cleanWav);
-            return res.status(500).json({ match: false, error: 'Audio conversie mislukt' });
+            return res.status(500).json({ match: false, error: 'Audio conversie mislukt op server' });
         }
 
-        console.log(`Schone WAV aangemaakt (${fs.statSync(cleanWav).size} bytes). Chromaprint berekenen...`);
+        const size = fs.statSync(cleanWav).size;
+        console.log(`Schone WAV aangemaakt (${size} bytes). fpcalc uitvoeren...`);
 
-        const chromaprintCmd = `ffmpeg -i "${cleanWav}" -f chromaprint -fp_format raw -`;
+        // 2. Gebruik fpcalc met -raw vlag op de geconverteerde WAV
+        const fpcalcCmd = `fpcalc -raw -json "${cleanWav}"`;
 
-        exec(chromaprintCmd, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+        exec(fpcalcCmd, { maxBuffer: 1024 * 1024 * 10 }, (fpErr, stdout, stderr) => {
             if (fs.existsSync(cleanWav)) fs.unlinkSync(cleanWav);
 
-            const combinedOutput = (stdout + "\n" + stderr).trim();
+            if (fpErr || !stdout) {
+                console.error("fpcalc fout:", fpErr || stderr);
+                return res.status(500).json({ match: false, error: 'fpcalc kon bestand niet verwerken' });
+            }
 
             try {
-                let liveFp = [];
+                const liveData = JSON.parse(stdout);
+                const liveFp = liveData.fingerprint || [];
 
-                const numberMatch = combinedOutput.match(/(-?\d+,\s*)+-?\d+/);
-                if (numberMatch) {
-                    liveFp = numberMatch[0].split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
-                } else {
-                    const lines = combinedOutput.split('\n');
-                    for (const line of lines) {
-                        if (line.includes(',') && !line.includes('Stream') && !line.includes('encoder')) {
-                            const parsed = line.split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
-                            if (parsed.length > liveFp.length) {
-                                liveFp = parsed;
-                            }
-                        }
-                    }
-                }
-
-                console.log(`FFmpeg live hashes geëxtraheerd: ${liveFp.length}`);
+                console.log(`fpcalc live hashes geëxtraheerd: ${liveFp.length}`);
 
                 const dbRaw = fs.readFileSync(dbPath, 'utf8');
                 const dbData = JSON.parse(dbRaw);
                 const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
 
-                if (liveFp.length < 3 || !dbFp) {
-                    return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd.' });
+                if (liveFp.length < 5 || !dbFp) {
+                    return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer opnieuw.' });
                 }
 
                 const liveLen = liveFp.length;
@@ -149,7 +140,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                     timecode_formatted: `${minutes}:${seconds}`
                 });
             } catch (e) {
-                console.error("Crash tijdens verwerking:", e);
+                console.error("Crash tijdens verwerking van JSON:", e);
                 res.status(500).json({ match: false, error: e.message });
             }
         });
