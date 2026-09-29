@@ -31,7 +31,6 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
 
     const rawPath = req.file.path;
     const inputWav = rawPath + '_input.wav';
-    const cleanWav = rawPath + '_clean.wav';
 
     try {
         fs.renameSync(rawPath, inputWav);
@@ -44,105 +43,111 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt' });
     }
 
-    // FFmpeg converteert naar een 100% standaarde 44.1kHz 16-bit Mono WAV
-    const convertCmd = `ffmpeg -y -i "${inputWav}" -ar 44100 -ac 1 -c:a pcm_s16le "${cleanWav}"`;
+    const wavSize = fs.statSync(inputWav).size;
+    console.log(`WAV ontvangen (${wavSize} bytes). Ingebouwde FFmpeg Chromaprint berekenen...`);
 
-    exec(convertCmd, (convErr) => {
+    // Gebruik FFmpeg met het ingebouwde chromaprint filter. 
+    // Output is een komma-gescheiden reeks 32-bit getallen direct op STDOUT
+    const ffmpegCmd = `ffmpeg -y -i "${inputWav}" -f chromaprint -fp_format raw -`;
+
+    exec(ffmpegCmd, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
         if (fs.existsSync(inputWav)) fs.unlinkSync(inputWav);
 
-        if (convErr || !fs.existsSync(cleanWav)) {
-            console.error("FFmpeg conversie fout:", convErr);
-            if (fs.existsSync(cleanWav)) fs.unlinkSync(cleanWav);
-            return res.status(500).json({ match: false, error: 'Audio conversie mislukt op server' });
-        }
+        const outputStr = (stdout || '') + '\n' + (stderr || '');
 
-        console.log(`44.1kHz WAV aangemaakt (${fs.statSync(cleanWav).size} bytes). fpcalc uitvoeren...`);
+        try {
+            let liveFp = [];
 
-        // Voer fpcalc uit op het 44.1kHz WAV bestand (zonder -raw vlag)
-        const fpcalcCmd = `fpcalc -json "${cleanWav}"`;
-
-        exec(fpcalcCmd, { maxBuffer: 1024 * 1024 * 10 }, (fpErr, stdout, stderr) => {
-            if (fs.existsSync(cleanWav)) fs.unlinkSync(cleanWav);
-
-            if (fpErr || !stdout) {
-                console.error("fpcalc execution error:", fpErr || stderr);
-                return res.status(500).json({ match: false, error: 'fpcalc kon audio niet verwerken' });
-            }
-
-            try {
-                const liveData = JSON.parse(stdout);
-                const liveFp = liveData.fingerprint || [];
-
-                console.log(`fpcalc live hashes geëxtraheerd: ${liveFp.length}`);
-
-                const dbRaw = fs.readFileSync(dbPath, 'utf8');
-                const dbData = JSON.parse(dbRaw);
-                const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
-
-                if (liveFp.length < 5 || !dbFp) {
-                    return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer opnieuw.' });
-                }
-
-                const liveLen = liveFp.length;
-                const candidates = [];
-                const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
-
-                for (let i = startIndex; i <= dbFp.length - liveLen; i++) {
-                    let matches = 0;
-                    let tested = 0;
-
-                    for (let j = 0; j < liveLen; j++) {
-                        const liveVal = liveFp[j] >>> 0;
-                        const dbVal = dbFp[i + j] >>> 0;
-
-                        if (liveVal === 0 || dbVal === 0) continue;
-
-                        tested++;
-                        const xor = (liveVal ^ dbVal) >>> 0;
-                        const bitMatches = 32 - countBits(xor);
-
-                        if (bitMatches >= 18) {
-                            matches++;
+            // 1. Zoek naar een komma-gescheiden getallenreeks in de FFmpeg output
+            const numberSequence = outputStr.match(/(-?\d+,\s*)+-?\d+/);
+            if (numberSequence) {
+                liveFp = numberSequence[0].split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
+            } else {
+                // 2. Fallback filter op alle getallenregels
+                const lines = outputStr.split('\n');
+                for (const line of lines) {
+                    if (line.includes(',') && !line.includes('Stream') && !line.includes('encoder')) {
+                        const parsed = line.split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
+                        if (parsed.length > liveFp.length) {
+                            liveFp = parsed;
                         }
                     }
+                }
+            }
 
-                    if (tested > 0) {
-                        const score = (matches / tested) * 100;
-                        candidates.push({ index: i, score: score, matches: matches, tested: tested });
+            console.log(`FFmpeg live hashes geëxtraheerd: ${liveFp.length}`);
+
+            const dbRaw = fs.readFileSync(dbPath, 'utf8');
+            const dbData = JSON.parse(dbRaw);
+            const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
+
+            if (liveFp.length < 5 || !dbFp) {
+                console.error("Te weinig hashes gedetecteerd:", outputStr.substring(0, 300));
+                return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer opnieuw.' });
+            }
+
+            const liveLen = liveFp.length;
+            const candidates = [];
+            
+            // Negeer eventuele stilte aanloop (eerste ~10 seconden)
+            const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
+
+            for (let i = startIndex; i <= dbFp.length - liveLen; i++) {
+                let matches = 0;
+                let tested = 0;
+
+                for (let j = 0; j < liveLen; j++) {
+                    const liveVal = liveFp[j] >>> 0;
+                    const dbVal = dbFp[i + j] >>> 0;
+
+                    if (liveVal === 0 || dbVal === 0) continue;
+
+                    tested++;
+                    const xor = (liveVal ^ dbVal) >>> 0;
+                    const bitMatches = 32 - countBits(xor);
+
+                    // Minstens 18 van de 32 bits identiek voor akoestische live-opnames
+                    if (bitMatches >= 18) {
+                        matches++;
                     }
                 }
 
-                candidates.sort((a, b) => b.matches - a.matches);
-
-                const topMatch = candidates[0] || { index: 0, score: 0, matches: 0 };
-                const bestIndex = topMatch.index;
-                const score = Math.round(topMatch.score);
-
-                const timecodeSeconds = bestIndex * 0.12383975;
-                const isMatch = topMatch.matches >= Math.floor(liveLen * 0.15);
-
-                const minutes = Math.floor(timecodeSeconds / 60);
-                const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
-
-                console.log(`Top 3 Matches in DB:`);
-                candidates.slice(0, 3).forEach((c, idx) => {
-                    const t = c.index * 0.12383975;
-                    const m = Math.floor(t / 60);
-                    const s = Math.floor(t % 60).toString().padStart(2, '0');
-                    console.log(`  #${idx + 1}: Tijd ${m}:${s} (Matches: ${c.matches}/${c.tested}, Score: ${Math.round(c.score)}%)`);
-                });
-
-                res.json({
-                    match: isMatch,
-                    score: score,
-                    timecode: timecodeSeconds,
-                    timecode_formatted: `${minutes}:${seconds}`
-                });
-            } catch (e) {
-                console.error("Crash tijdens verwerking van JSON:", e);
-                res.status(500).json({ match: false, error: e.message });
+                if (tested > 0) {
+                    const score = (matches / tested) * 100;
+                    candidates.push({ index: i, score: score, matches: matches, tested: tested });
+                }
             }
-        });
+
+            candidates.sort((a, b) => b.matches - a.matches);
+
+            const topMatch = candidates[0] || { index: 0, score: 0, matches: 0 };
+            const bestIndex = topMatch.index;
+            const score = Math.round(topMatch.score);
+
+            const timecodeSeconds = bestIndex * 0.12383975;
+            const isMatch = topMatch.matches >= Math.floor(liveLen * 0.15);
+
+            const minutes = Math.floor(timecodeSeconds / 60);
+            const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
+
+            console.log(`Top 3 Matches in DB:`);
+            candidates.slice(0, 3).forEach((c, idx) => {
+                const t = c.index * 0.12383975;
+                const m = Math.floor(t / 60);
+                const s = Math.floor(t % 60).toString().padStart(2, '0');
+                console.log(`  #${idx + 1}: Tijd ${m}:${s} (Matches: ${c.matches}/${c.tested}, Score: ${Math.round(c.score)}%)`);
+            });
+
+            res.json({
+                match: isMatch,
+                score: score,
+                timecode: timecodeSeconds,
+                timecode_formatted: `${minutes}:${seconds}`
+            });
+        } catch (e) {
+            console.error("Crash tijdens verwerking:", e);
+            res.status(500).json({ match: false, error: e.message });
+        }
     });
 });
 
