@@ -44,8 +44,8 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt' });
     }
 
-    // Normaliseer en versterk de audio via FFmpeg
-    const convertCmd = `ffmpeg -y -i "${inputWav}" -af "volume=4.0,loudnorm" -ar 11025 -ac 1 "${cleanWav}"`;
+    // FFmpeg converteert de schone WAV naar 11025Hz Mono zonder vervorming
+    const convertCmd = `ffmpeg -y -i "${inputWav}" -ar 11025 -ac 1 "${cleanWav}"`;
 
     exec(convertCmd, (convErr) => {
         if (fs.existsSync(inputWav)) fs.unlinkSync(inputWav);
@@ -90,7 +90,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                 const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
 
                 if (liveFp.length < 3 || !dbFp) {
-                    return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd. Speel de CD luider af.' });
+                    return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd.' });
                 }
 
                 const liveLen = liveFp.length;
@@ -111,7 +111,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                         const xor = (liveVal ^ dbVal) >>> 0;
                         const bitMatches = 32 - countBits(xor);
 
-                        if (bitMatches >= 16) { // Soepelere drempel voor live accoustische opnames
+                        if (bitMatches >= 18) {
                             matches++;
                         }
                     }
@@ -129,7 +129,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                 const score = Math.round(topMatch.score);
 
                 const timecodeSeconds = bestIndex * 0.12383975;
-                const isMatch = topMatch.matches >= Math.floor(liveLen * 0.12);
+                const isMatch = topMatch.matches >= Math.floor(liveLen * 0.15);
 
                 const minutes = Math.floor(timecodeSeconds / 60);
                 const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
