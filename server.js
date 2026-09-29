@@ -46,50 +46,36 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
     const wavSize = fs.statSync(inputWav).size;
     console.log(`WAV ontvangen (${wavSize} bytes). Ingebouwde FFmpeg Chromaprint berekenen...`);
 
-    // Gebruik FFmpeg met het ingebouwde chromaprint filter. 
-    // Output is een komma-gescheiden reeks 32-bit getallen direct op STDOUT
+    // Gebruik FFmpeg met chromaprint filter output direct naar stdout
     const ffmpegCmd = `ffmpeg -y -i "${inputWav}" -f chromaprint -fp_format raw -`;
 
-    exec(ffmpegCmd, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+    // BELANGRIJK: { encoding: 'buffer' } zorgt dat Node.js de binaire data NIET sloopt als tekst!
+    exec(ffmpegCmd, { encoding: 'buffer', maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
         if (fs.existsSync(inputWav)) fs.unlinkSync(inputWav);
 
-        const outputStr = (stdout || '') + '\n' + (stderr || '');
-
         try {
-            let liveFp = [];
+            const liveFp = [];
 
-            // 1. Zoek naar een komma-gescheiden getallenreeks in de FFmpeg output
-            const numberSequence = outputStr.match(/(-?\d+,\s*)+-?\d+/);
-            if (numberSequence) {
-                liveFp = numberSequence[0].split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
-            } else {
-                // 2. Fallback filter op alle getallenregels
-                const lines = outputStr.split('\n');
-                for (const line of lines) {
-                    if (line.includes(',') && !line.includes('Stream') && !line.includes('encoder')) {
-                        const parsed = line.split(',').map(n => parseInt(n.trim(), 10)).filter(n => !isNaN(n));
-                        if (parsed.length > liveFp.length) {
-                            liveFp = parsed;
-                        }
-                    }
+            // stdout is nu een zuivere Node.js Buffer.
+            // Elke 32-bit Chromaprint hash is exact 4 bytes lang (Little Endian integer)
+            if (Buffer.isBuffer(stdout) && stdout.length >= 4) {
+                for (let i = 0; i <= stdout.length - 4; i += 4) {
+                    liveFp.push(stdout.readInt32LE(i));
                 }
             }
 
-            console.log(`FFmpeg live hashes geëxtraheerd: ${liveFp.length}`);
+            console.log(`FFmpeg binaire live hashes geëxtraheerd: ${liveFp.length}`);
 
             const dbRaw = fs.readFileSync(dbPath, 'utf8');
             const dbData = JSON.parse(dbRaw);
             const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
 
             if (liveFp.length < 5 || !dbFp) {
-                console.error("Te weinig hashes gedetecteerd:", outputStr.substring(0, 300));
                 return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer opnieuw.' });
             }
 
             const liveLen = liveFp.length;
             const candidates = [];
-            
-            // Negeer eventuele stilte aanloop (eerste ~10 seconden)
             const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
 
             for (let i = startIndex; i <= dbFp.length - liveLen; i++) {
@@ -106,7 +92,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                     const xor = (liveVal ^ dbVal) >>> 0;
                     const bitMatches = 32 - countBits(xor);
 
-                    // Minstens 18 van de 32 bits identiek voor akoestische live-opnames
+                    // 18 van de 32 bits identiek voor akoestische opnames in een kamer
                     if (bitMatches >= 18) {
                         matches++;
                     }
