@@ -31,7 +31,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
 
     const rawPath = req.file.path;
     const inputWav = rawPath + '_input.wav';
-    const cleanWav = rawPath + '_clean.wav';
+    const pcmRawPath = rawPath + '_clean.raw';
 
     try {
         fs.renameSync(rawPath, inputWav);
@@ -44,26 +44,26 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         return res.status(500).json({ match: false, error: 'JSON database ontbreekt' });
     }
 
-    // 1. Converteer de binnenkomende WAV naar gestandaardiseerde 11025Hz 16-bit Mono PCM WAV
-    const convertCmd = `ffmpeg -y -i "${inputWav}" -ar 11025 -ac 1 -c:a pcm_s16le "${cleanWav}"`;
+    // 1. Converteer de binnenkomende audio naar headerless PCM 16-bit Mono op 11025 Hz (-f s16le)
+    const convertCmd = `ffmpeg -y -i "${inputWav}" -f s16le -ar 11025 -ac 1 -c:a pcm_s16le "${pcmRawPath}"`;
 
     exec(convertCmd, (convErr) => {
         if (fs.existsSync(inputWav)) fs.unlinkSync(inputWav);
 
-        if (convErr || !fs.existsSync(cleanWav)) {
+        if (convErr || !fs.existsSync(pcmRawPath)) {
             console.error("FFmpeg conversiefout:", convErr);
-            if (fs.existsSync(cleanWav)) fs.unlinkSync(cleanWav);
+            if (fs.existsSync(pcmRawPath)) fs.unlinkSync(pcmRawPath);
             return res.status(500).json({ match: false, error: 'Audio conversie mislukt op server' });
         }
 
-        const size = fs.statSync(cleanWav).size;
-        console.log(`Schone WAV aangemaakt (${size} bytes). fpcalc uitvoeren...`);
+        const size = fs.statSync(pcmRawPath).size;
+        console.log(`Ruwe PCM stream aangemaakt (${size} bytes). fpcalc uitvoeren...`);
 
-        // 2. Gebruik fpcalc met -raw vlag op de geconverteerde WAV
-        const fpcalcCmd = `fpcalc -raw -json "${cleanWav}"`;
+        // 2. Voer fpcalc -raw uit met expliciete specificaties (rate 11025, channels 1) op het .raw bestand
+        const fpcalcCmd = `fpcalc -raw -rate 11025 -channels 1 -json "${pcmRawPath}"`;
 
         exec(fpcalcCmd, { maxBuffer: 1024 * 1024 * 10 }, (fpErr, stdout, stderr) => {
-            if (fs.existsSync(cleanWav)) fs.unlinkSync(cleanWav);
+            if (fs.existsSync(pcmRawPath)) fs.unlinkSync(pcmRawPath);
 
             if (fpErr || !stdout) {
                 console.error("fpcalc fout:", fpErr || stderr);
