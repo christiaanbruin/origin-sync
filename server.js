@@ -16,10 +16,58 @@ app.use(cors({
 app.options('*', cors());
 
 const upload = multer({ dest: '/tmp/' });
-const dbPath = path.join(__dirname, 'day6_fingerprint_clean.json');
+
+// 1. LAAD ALLE 6 DE FINGERPRINT DATABASE BESTANDEN IN
+const tracks = [
+    { name: 'Day 1', file: 'day1_fingerprint_new.json' },
+    { name: 'Day 2', file: 'day2_fingerprint_new.json' },
+    { name: 'Day 3', file: 'day3_fingerprint_new.json' },
+    { name: 'Day 4', file: 'day4_fingerprint_new.json' },
+    { name: 'Day 5', file: 'day5_fingerprint_new.json' },
+    { name: 'Day 6', file: 'day6_fingerprint_new.json' }
+];
+
+let fingerprintDb = [];
+
+function loadDatabases() {
+    fingerprintDb = [];
+    tracks.forEach(trackInfo => {
+        const fullPath = path.join(__dirname, trackInfo.file);
+        if (fs.existsSync(fullPath)) {
+            try {
+                const raw = fs.readFileSync(fullPath, 'utf8');
+                const parsed = JSON.parse(raw);
+                const hashes = Array.isArray(parsed) ? parsed : (parsed.fingerprint || parsed.hashes);
+                const duration = parsed.duration || 0;
+
+                if (hashes && hashes.length > 0) {
+                    fingerprintDb.push({
+                        name: trackInfo.name,
+                        duration: duration,
+                        hashes: hashes,
+                        // Dynamische tijdsstap per hash:
+                        timeStep: duration > 0 ? (duration / hashes.length) : 0.12383975
+                    });
+                    console.log(`[DB LOADED] ${trackInfo.name} (${hashes.length} hashes, ${duration}s)`);
+                }
+            } catch (e) {
+                console.error(`[DB ERROR] Fout bij laden van ${trackInfo.file}:`, e.message);
+            }
+        } else {
+            console.warn(`[DB MISSING] Bestand niet gevonden: ${trackInfo.file}`);
+        }
+    });
+}
+
+// Laad databases direct bij opstarten
+loadDatabases();
 
 app.get('/api/match', (req, res) => {
-    res.json({ status: "online", message: "Render backend werkt!" });
+    res.json({ 
+        status: "online", 
+        loadedTracks: fingerprintDb.map(d => d.name),
+        message: "Render multi-track backend werkt!" 
+    });
 });
 
 app.post('/api/match', upload.single('audio'), (req, res) => {
@@ -38,9 +86,9 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         console.error("Hernoemen mislukt:", e);
     }
 
-    if (!fs.existsSync(dbPath)) {
+    if (fingerprintDb.length === 0) {
         if (fs.existsSync(inputWav)) fs.unlinkSync(inputWav);
-        return res.status(500).json({ match: false, error: 'JSON database ontbreekt' });
+        return res.status(500).json({ match: false, error: 'Geen enkele JSON fingerprint database geladen op server' });
     }
 
     const wavSize = fs.statSync(inputWav).size;
@@ -62,73 +110,72 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
 
             console.log(`FFmpeg binaire live hashes geëxtraheerd: ${liveFp.length}`);
 
-            const dbRaw = fs.readFileSync(dbPath, 'utf8');
-            const dbData = JSON.parse(dbRaw);
-            const dbFp = Array.isArray(dbData) ? dbData : (dbData.fingerprint || dbData.hashes);
-
-            if (liveFp.length < 10 || !dbFp) {
+            if (liveFp.length < 10) {
                 return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer opnieuw.' });
             }
 
             const liveLen = liveFp.length;
-            const candidates = [];
-            
-            // Negeer hele korte stilte aanloop (~eerste 2%)
-            const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
+            let allCandidates = [];
 
-            for (let i = startIndex; i <= dbFp.length - liveLen; i++) {
-                let matches = 0;
-                let tested = 0;
+            // 2. SCAN DOOR ALLES 6 DE TRACKS IN HET GEHEUGEN
+            fingerprintDb.forEach(trackDb => {
+                const dbFp = trackDb.hashes;
+                const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
 
-                for (let j = 0; j < liveLen; j++) {
-                    const liveVal = liveFp[j] >>> 0;
-                    const dbVal = dbFp[i + j] >>> 0;
+                for (let i = startIndex; i <= dbFp.length - liveLen; i++) {
+                    let matches = 0;
+                    let tested = 0;
 
-                    // Sla lege/stilte hashes over
-                    if (liveVal === 0 || dbVal === 0) continue;
+                    for (let j = 0; j < liveLen; j++) {
+                        const liveVal = liveFp[j] >>> 0;
+                        const dbVal = dbFp[i + j] >>> 0;
 
-                    tested++;
-                    const xor = (liveVal ^ dbVal) >>> 0;
-                    const bitMatches = 32 - countBits(xor);
+                        if (liveVal === 0 || dbVal === 0) continue;
 
-                    // STRENGERE DREMPEL: Minstens 22 van de 32 bits moeten exact overeenkomen
-                    if (bitMatches >= 22) {
-                        matches++;
+                        tested++;
+                        const xor = (liveVal ^ dbVal) >>> 0;
+                        const bitMatches = 32 - countBits(xor);
+
+                        if (bitMatches >= 22) {
+                            matches++;
+                        }
+                    }
+
+                    if (tested > 0) {
+                        const score = (matches / tested) * 100;
+                        allCandidates.push({
+                            trackName: trackDb.name,
+                            index: i,
+                            score: score,
+                            matches: matches,
+                            tested: tested,
+                            timeStep: trackDb.timeStep
+                        });
                     }
                 }
+            });
 
-                if (tested > 0) {
-                    const score = (matches / tested) * 100;
-                    candidates.push({ index: i, score: score, matches: matches, tested: tested });
-                }
-            }
+            // Sorteer op aantal matches en score
+            allCandidates.sort((a, b) => (b.matches - a.matches) || (b.score - a.score));
 
-            // Sorteer op aantal matchende hashes en daarna op percentage score
-            candidates.sort((a, b) => (b.matches - a.matches) || (b.score - a.score));
-
-            const topMatch = candidates[0] || { index: 0, score: 0, matches: 0 };
+            const topMatch = allCandidates[0] || { trackName: 'Unknown', index: 0, score: 0, matches: 0, timeStep: 0.123 };
             const bestIndex = topMatch.index;
             const score = Math.round(topMatch.score);
 
-            const timecodeSeconds = bestIndex * 0.12383975;
+            // Dynamische tijdcodeberekening
+            const timecodeSeconds = bestIndex * topMatch.timeStep;
             
-            // STRENGERE CRITERIA VOOR GOEDGEKEURDE MATCH:
-            // Minstens 30% van de hashes moet matchen én de totaalscore moet >= 35% zijn
+            // STRENGERE CRITERIA VOOR MATCH
             const isMatch = topMatch.matches >= Math.floor(liveLen * 0.30) && score >= 35;
 
             const minutes = Math.floor(timecodeSeconds / 60);
             const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
 
-            console.log(`Top 3 Matches in DB:`);
-            candidates.slice(0, 3).forEach((c, idx) => {
-                const t = c.index * 0.12383975;
-                const m = Math.floor(t / 60);
-                const s = Math.floor(t % 60).toString().padStart(2, '0');
-                console.log(`  #${idx + 1}: Tijd ${m}:${s} (Matches: ${c.matches}/${c.tested}, Score: ${Math.round(c.score)}%)`);
-            });
+            console.log(`--- MATCH RESULTATEN ---`);
+            console.log(`Beste Match: ${topMatch.trackName} op ${minutes}:${seconds} (${topMatch.matches}/${topMatch.tested} matches, Score: ${score}%)`);
 
             if (!isMatch) {
-                console.log(`Geen overtuigende match gevonden. Beste poging was Tijd ${minutes}:${seconds} met ${score}% score.`);
+                console.log(`Geen overtuigende match. Beste was ${topMatch.trackName} met ${score}% score.`);
                 return res.json({
                     match: false,
                     score: score,
@@ -136,12 +183,15 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                 });
             }
 
+            // AANSPRAAK MET FRONTEND: Stuur ook de 'track' naam mee!
             res.json({
                 match: true,
+                track: topMatch.trackName,
                 score: score,
                 timecode: timecodeSeconds,
                 timecode_formatted: `${minutes}:${seconds}`
             });
+
         } catch (e) {
             console.error("Crash tijdens verwerking:", e);
             res.status(500).json({ match: false, error: e.message });
@@ -156,4 +206,4 @@ function countBits(n) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server draait poort ${PORT}`));
+app.listen(PORT, () => console.log(`Multi-Track Receiver Server draait op poort ${PORT}`));
