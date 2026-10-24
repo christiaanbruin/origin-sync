@@ -64,7 +64,7 @@ app.get('/api/match', (req, res) => {
     res.json({ 
         status: "online", 
         loadedTracks: fingerprintDb.map(d => d.name),
-        message: "Render multi-track backend (Accurate) werkt!" 
+        message: "Render multi-track backend (High Precision) werkt!" 
     });
 });
 
@@ -112,7 +112,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
             const liveLen = liveFp.length;
             let allCandidates = [];
 
-            // Scan door alle 6 de tracks met de beproefde snelle 18-bit logica!
+            // Scan door alle 6 de tracks
             fingerprintDb.forEach(trackDb => {
                 const dbFp = trackDb.hashes;
                 const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
@@ -131,7 +131,7 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                         const xor = (liveVal ^ dbVal) >>> 0;
                         const bitMatches = 32 - countBits(xor);
 
-                        // HET GEHEIM VOOR ACCURATE SYNC IN EEN KAMER:
+                        // Akoestische drempelwaarde voor kameropnames
                         if (bitMatches >= 18) {
                             matches++;
                         }
@@ -144,7 +144,8 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                             index: i,
                             score: score,
                             matches: matches,
-                            tested: tested
+                            tested: tested,
+                            dbFpRef: dbFp
                         });
                     }
                 }
@@ -154,13 +155,21 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
             allCandidates.sort((a, b) => b.matches - a.matches);
 
             const topMatch = allCandidates[0] || { trackName: 'Unknown', index: 0, score: 0, matches: 0 };
-            const bestIndex = topMatch.index;
+            let exactIndex = topMatch.index;
             const score = Math.round(topMatch.score);
 
-            // Tijdcode op de exacte vertrouwde manier berekend
-            const timecodeSeconds = bestIndex * CHROMA_TIME_STEP;
-            
-            // 15% van de hashes is al voldoende voor een sluitende match
+            // Sub-hash Piek Verfijning (Parabolische Interpolatie voor Sub-Second Precisie)
+            if (topMatch.dbFpRef && exactIndex > 0 && exactIndex < topMatch.dbFpRef.length - 1) {
+                const scorePrev = calculateScoreAtIndex(topMatch.dbFpRef, liveFp, exactIndex - 1);
+                const scoreNext = calculateScoreAtIndex(topMatch.dbFpRef, liveFp, exactIndex + 1);
+                
+                const delta = (scoreNext - scorePrev) / (2 * (2 * topMatch.score - scorePrev - scoreNext) || 1);
+                if (!isNaN(delta) && Math.abs(delta) < 1) {
+                    exactIndex += delta;
+                }
+            }
+
+            const timecodeSeconds = exactIndex * CHROMA_TIME_STEP;
             const isMatch = topMatch.matches >= Math.floor(liveLen * 0.15);
 
             const minutes = Math.floor(timecodeSeconds / 60);
@@ -190,6 +199,18 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
         }
     });
 });
+
+function calculateScoreAtIndex(dbFp, liveFp, index) {
+    let matches = 0, tested = 0;
+    for (let j = 0; j < liveFp.length; j++) {
+        const liveVal = liveFp[j] >>> 0;
+        const dbVal = dbFp[index + j] >>> 0;
+        if (liveVal === 0 || dbVal === 0) continue;
+        tested++;
+        if ((32 - countBits((liveVal ^ dbVal) >>> 0)) >= 18) matches++;
+    }
+    return tested > 0 ? (matches / tested) * 100 : 0;
+}
 
 function countBits(n) {
     n = n - ((n >>> 1) & 0x55555555);
