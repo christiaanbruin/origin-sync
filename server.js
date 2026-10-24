@@ -17,7 +17,10 @@ app.options('*', cors());
 
 const upload = multer({ dest: '/tmp/' });
 
-// 1. LAAD ALLE 6 DE FINGERPRINT DATABASE BESTANDEN IN
+// Vaste accurate Chromaprint tijdsstap per hash index
+const CHROMA_TIME_STEP = 0.12383975;
+
+// Laad alle 6 de fingerprint bestanden
 const tracks = [
     { name: 'Day 1', file: 'day1_fingerprint_new.json' },
     { name: 'Day 2', file: 'day2_fingerprint_new.json' },
@@ -38,17 +41,13 @@ function loadDatabases() {
                 const raw = fs.readFileSync(fullPath, 'utf8');
                 const parsed = JSON.parse(raw);
                 const hashes = Array.isArray(parsed) ? parsed : (parsed.fingerprint || parsed.hashes);
-                const duration = parsed.duration || 0;
 
                 if (hashes && hashes.length > 0) {
                     fingerprintDb.push({
                         name: trackInfo.name,
-                        duration: duration,
-                        hashes: hashes,
-                        // Dynamische tijdsstap per hash:
-                        timeStep: duration > 0 ? (duration / hashes.length) : 0.12383975
+                        hashes: hashes
                     });
-                    console.log(`[DB LOADED] ${trackInfo.name} (${hashes.length} hashes, ${duration}s)`);
+                    console.log(`[DB LOADED] ${trackInfo.name} (${hashes.length} hashes)`);
                 }
             } catch (e) {
                 console.error(`[DB ERROR] Fout bij laden van ${trackInfo.file}:`, e.message);
@@ -59,14 +58,13 @@ function loadDatabases() {
     });
 }
 
-// Laad databases direct bij opstarten
 loadDatabases();
 
 app.get('/api/match', (req, res) => {
     res.json({ 
         status: "online", 
         loadedTracks: fingerprintDb.map(d => d.name),
-        message: "Render multi-track backend werkt!" 
+        message: "Render multi-track backend (Accurate) werkt!" 
     });
 });
 
@@ -88,11 +86,8 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
 
     if (fingerprintDb.length === 0) {
         if (fs.existsSync(inputWav)) fs.unlinkSync(inputWav);
-        return res.status(500).json({ match: false, error: 'Geen enkele JSON fingerprint database geladen op server' });
+        return res.status(500).json({ match: false, error: 'Geen JSON fingerprint database geladen' });
     }
-
-    const wavSize = fs.statSync(inputWav).size;
-    console.log(`WAV ontvangen (${wavSize} bytes). Ingebouwde FFmpeg Chromaprint berekenen...`);
 
     const ffmpegCmd = `ffmpeg -y -i "${inputWav}" -f chromaprint -fp_format raw -`;
 
@@ -110,14 +105,14 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
 
             console.log(`FFmpeg binaire live hashes geëxtraheerd: ${liveFp.length}`);
 
-            if (liveFp.length < 10) {
-                return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd. Probeer opnieuw.' });
+            if (liveFp.length < 5) {
+                return res.json({ match: false, score: 0, error: 'Te weinig audio-kenmerken gedetecteerd.' });
             }
 
             const liveLen = liveFp.length;
             let allCandidates = [];
 
-            // 2. SCAN DOOR ALLES 6 DE TRACKS IN HET GEHEUGEN
+            // Scan door alle 6 de tracks met de beproefde snelle 18-bit logica!
             fingerprintDb.forEach(trackDb => {
                 const dbFp = trackDb.hashes;
                 const startIndex = Math.min(80, Math.floor(dbFp.length * 0.02));
@@ -136,7 +131,8 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                         const xor = (liveVal ^ dbVal) >>> 0;
                         const bitMatches = 32 - countBits(xor);
 
-                        if (bitMatches >= 22) {
+                        // HET GEHEIM VOOR ACCURATE SYNC IN EEN KAMER:
+                        if (bitMatches >= 18) {
                             matches++;
                         }
                     }
@@ -148,42 +144,38 @@ app.post('/api/match', upload.single('audio'), (req, res) => {
                             index: i,
                             score: score,
                             matches: matches,
-                            tested: tested,
-                            timeStep: trackDb.timeStep
+                            tested: tested
                         });
                     }
                 }
             });
 
-            // Sorteer op aantal matches en score
-            allCandidates.sort((a, b) => (b.matches - a.matches) || (b.score - a.score));
+            // Sorteer op aantal absolute matches
+            allCandidates.sort((a, b) => b.matches - a.matches);
 
-            const topMatch = allCandidates[0] || { trackName: 'Unknown', index: 0, score: 0, matches: 0, timeStep: 0.123 };
+            const topMatch = allCandidates[0] || { trackName: 'Unknown', index: 0, score: 0, matches: 0 };
             const bestIndex = topMatch.index;
             const score = Math.round(topMatch.score);
 
-            // Dynamische tijdcodeberekening
-            const timecodeSeconds = bestIndex * topMatch.timeStep;
+            // Tijdcode op de exacte vertrouwde manier berekend
+            const timecodeSeconds = bestIndex * CHROMA_TIME_STEP;
             
-            // STRENGERE CRITERIA VOOR MATCH
-            const isMatch = topMatch.matches >= Math.floor(liveLen * 0.30) && score >= 35;
+            // 15% van de hashes is al voldoende voor een sluitende match
+            const isMatch = topMatch.matches >= Math.floor(liveLen * 0.15);
 
             const minutes = Math.floor(timecodeSeconds / 60);
             const seconds = Math.floor(timecodeSeconds % 60).toString().padStart(2, '0');
 
-            console.log(`--- MATCH RESULTATEN ---`);
-            console.log(`Beste Match: ${topMatch.trackName} op ${minutes}:${seconds} (${topMatch.matches}/${topMatch.tested} matches, Score: ${score}%)`);
+            console.log(`Top Match: ${topMatch.trackName} op ${minutes}:${seconds} (${topMatch.matches} matches, Score: ${score}%)`);
 
             if (!isMatch) {
-                console.log(`Geen overtuigende match. Beste was ${topMatch.trackName} met ${score}% score.`);
                 return res.json({
                     match: false,
                     score: score,
-                    error: 'Geen duidelijke overeenkomst gevonden. Zorg dat de audio goed hoorbaar is.'
+                    error: 'Geen duidelijke overeenkomst gevonden.'
                 });
             }
 
-            // AANSPRAAK MET FRONTEND: Stuur ook de 'track' naam mee!
             res.json({
                 match: true,
                 track: topMatch.trackName,
@@ -206,4 +198,4 @@ function countBits(n) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Multi-Track Receiver Server draait op poort ${PORT}`));
+app.listen(PORT, () => console.log(`Server draait op poort ${PORT}`));
